@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { backupDbNow, parseHuggingFaceTarget, restoreDbBackupIfNeeded } from '../../lib/db-backup.js';
+import { backupDbNow, parseHuggingFaceTarget, restoreDbBackupIfNeeded, validateRestoredSqlite } from '../../lib/db-backup.js';
 import { aclEntries } from '../helpers/acl.js';
 
 const ORIGINAL_BACKUP_PATH = process.env.FREEAPI_DB_BACKUP_PATH;
@@ -54,6 +54,169 @@ describe('encrypted SQLite backup', () => {
     const restored = new Database(dbPath);
     expect((restored.prepare('SELECT name FROM items').get() as { name: string }).name).toBe('survived');
     restored.close();
+  });
+});
+
+
+
+describe('safe restore installation', () => {
+  afterEach(() => restoreEnv());
+
+  it('does not install an invalid SQLite backup over an empty destination', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-safe-restore-'));
+    const sourcePath = path.join(dir, 'source.db');
+    const invalidSourcePath = path.join(dir, 'invalid-source.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    const destinationPath = path.join(dir, 'destination.db');
+
+    const db = new Database(sourcePath);
+    db.exec('CREATE TABLE items (name TEXT NOT NULL)');
+    fs.writeFileSync(invalidSourcePath, 'not a SQLite database');
+
+    process.env.ENCRYPTION_KEY = 'b'.repeat(64);
+    delete process.env.FREEAPI_DB_BACKUP_TARGET;
+    delete process.env.FREEAPI_DB_BACKUP_URL;
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+
+    await backupDbNow(db, invalidSourcePath);
+    db.close();
+
+    fs.writeFileSync(destinationPath, '');
+
+    await expect(restoreDbBackupIfNeeded(destinationPath))
+      .rejects.toThrow(/valid SQLite database header/);
+
+    expect(fs.statSync(destinationPath).size).toBe(0);
+    expect(
+      fs.readdirSync(dir).filter(name => name.startsWith('.destination.db.restore-')),
+    ).toEqual([]);
+  });
+});
+
+describe('restored SQLite validation', () => {
+  it('accepts a valid SQLite database containing an application table', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-validate-valid-'));
+    const dbPath = path.join(dir, 'valid.db');
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT NOT NULL)');
+    db.close();
+
+    expect(() => validateRestoredSqlite(dbPath)).not.toThrow();
+  });
+
+  it('rejects a file without a SQLite header', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-validate-header-'));
+    const dbPath = path.join(dir, 'invalid.db');
+    fs.writeFileSync(dbPath, 'not a SQLite database');
+
+    expect(() => validateRestoredSqlite(dbPath)).toThrow(/valid SQLite database header/);
+  });
+
+  it('rejects a SQLite database with no application tables', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-validate-empty-'));
+    const dbPath = path.join(dir, 'empty.db');
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE temporary_items (value TEXT); DROP TABLE temporary_items;');
+    db.close();
+
+    expect(() => validateRestoredSqlite(dbPath)).toThrow(/no application tables/);
+  });
+});
+
+
+describe('backup reliability', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    restoreEnv();
+  });
+
+  it('refuses to upload when the WAL checkpoint is busy', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-wal-busy-'));
+    const dbPath = path.join(dir, 'database.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    fs.writeFileSync(dbPath, 'database fixture');
+
+    delete process.env.FREEAPI_DB_BACKUP_TARGET;
+    delete process.env.FREEAPI_DB_BACKUP_URL;
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+
+    const db = {
+      pragma: vi.fn(() => [{ busy: 1, log: 2, checkpointed: 0 }]),
+    } as unknown as Parameters<typeof backupDbNow>[0];
+
+    await expect(backupDbNow(db, dbPath)).rejects.toThrow(/WAL checkpoint is busy/);
+    expect(db.pragma).toHaveBeenCalledWith('wal_checkpoint(TRUNCATE)');
+    expect(fs.existsSync(backupPath)).toBe(false);
+  });
+
+  it('coalesces simultaneous requests into one upload', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-single-flight-'));
+    const dbPath = path.join(dir, 'database.db');
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT);');
+
+    delete process.env.FREEAPI_DB_BACKUP_URL;
+    delete process.env.FREEAPI_DB_BACKUP_PATH;
+    process.env.FREEAPI_DB_BACKUP_TARGET = 'https://storage.example.com/freeapi.db.enc';
+    process.env.ENCRYPTION_KEY = 'c'.repeat(64);
+
+    let releaseFetch: ((response: Response) => void) | undefined;
+    const fetchMock = vi.fn(
+      (_url: string, _init: RequestInit) =>
+        new Promise<Response>(resolve => { releaseFetch = resolve; }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    let pending: Promise<unknown> | undefined;
+    try {
+      pending = backupDbNow(db, dbPath);
+      const duplicate = backupDbNow(db, dbPath);
+
+      expect(duplicate).toBe(pending);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      if (!releaseFetch) throw new Error('Upload did not start.');
+      releaseFetch(new Response('', { status: 200 }));
+
+      await Promise.all([pending, duplicate]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseFetch?.(new Response('', { status: 200 }));
+      await pending?.catch(() => undefined);
+      db.close();
+    }
+  });
+
+  it('preserves an existing backup when atomic replacement fails', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-atomic-backup-'));
+    const dbPath = path.join(dir, 'database.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT);');
+    fs.writeFileSync(backupPath, 'previous-good-backup');
+
+    delete process.env.FREEAPI_DB_BACKUP_TARGET;
+    delete process.env.FREEAPI_DB_BACKUP_URL;
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+    process.env.ENCRYPTION_KEY = 'd'.repeat(64);
+
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+      throw new Error('simulated rename failure');
+    });
+
+    try {
+      await expect(backupDbNow(db, dbPath))
+        .rejects.toThrow(/simulated rename failure/);
+    } finally {
+      renameSpy.mockRestore();
+      db.close();
+    }
+
+    expect(fs.readFileSync(backupPath, 'utf8')).toBe('previous-good-backup');
+    expect(
+      fs.readdirSync(dir).filter(name => name.startsWith('.backup.bin.backup-')),
+    ).toEqual([]);
   });
 });
 
